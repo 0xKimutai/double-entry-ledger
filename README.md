@@ -1,6 +1,6 @@
 # Double-Entry Ledger System
 
-A Go and PostgreSQL ledger API for exploring double-entry accounting, transactional correctness, and idempotent payments. This learning project intentionally has no authentication.
+A Go and PostgreSQL ledger API for exploring double-entry accounting, transactional correctness, and idempotent payments. 
 
 ## Run locally
 
