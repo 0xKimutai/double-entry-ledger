@@ -1,0 +1,19 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Build and test artifacts
+/server
+/ledger-api
+/coverage.out
+/coverage.html
+*.test
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+
+# Logs
+*.log
