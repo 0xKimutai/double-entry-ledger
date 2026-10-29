@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/0xKimutai/double-entry-ledger/internal/ledger"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -17,6 +18,12 @@ import (
 type Repository struct {
 	db *sql.DB
 }
+
+const (
+	transactionMaxAttempts = 3
+	transactionRetryDelay  = 10 * time.Millisecond
+	transactionRetryMax    = 100 * time.Millisecond
+)
 
 func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
@@ -100,13 +107,30 @@ func (r *Repository) Transfer(ctx context.Context, sourceAccountID, destinationA
 }
 
 func (r *Repository) executeTransfer(ctx context.Context, kind, sourceID, destinationID, key string, amount int64) (ledger.Transfer, bool, error) {
+	for attempt := 1; ; attempt++ {
+		transfer, replayed, err := r.executeTransferOnce(ctx, kind, sourceID, destinationID, key, amount)
+		if err == nil || !isRetryableTransactionError(err) {
+			return transfer, replayed, err
+		}
+		if attempt == transactionMaxAttempts {
+			return ledger.Transfer{}, false, fmt.Errorf("transfer transaction failed after %d attempts: %w", attempt, err)
+		}
+		if waitErr := waitForTransactionRetry(ctx, transactionRetryDelayFor(attempt)); waitErr != nil {
+			return ledger.Transfer{}, false, errors.Join(err, fmt.Errorf("wait to retry transfer transaction: %w", waitErr))
+		}
+	}
+}
+
+func (r *Repository) executeTransferOnce(ctx context.Context, kind, sourceID, destinationID, key string, amount int64) (result ledger.Transfer, replayed bool, resultErr error) {
 	// Posting, projection updates, and journal entries commit atomically.
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return ledger.Transfer{}, false, fmt.Errorf("begin transfer transaction: %w", err)
 	}
 	defer func() {
-		_ = tx.Rollback()
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("rollback transfer transaction: %w", rollbackErr))
+		}
 	}()
 
 	if kind == "deposit" {
@@ -209,6 +233,36 @@ func (r *Repository) executeTransfer(ctx context.Context, kind, sourceID, destin
 		return ledger.Transfer{}, false, fmt.Errorf("commit transfer: %w", err)
 	}
 	return transfer, false, nil
+}
+
+func isRetryableTransactionError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "40001" || pgErr.Code == "40P01"
+}
+
+func transactionRetryDelayFor(retry int) time.Duration {
+	delay := transactionRetryDelay
+	for range retry - 1 {
+		delay *= 2
+		if delay >= transactionRetryMax {
+			return transactionRetryMax
+		}
+	}
+	return delay
+}
+
+func waitForTransactionRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (r *Repository) idempotentReplay(ctx context.Context, key, kind, sourceID, destinationID string, amount int64) (ledger.Transfer, bool, error) {
